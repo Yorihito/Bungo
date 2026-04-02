@@ -97,7 +97,11 @@ def to_docx(doc: BungoDocument, output_path: PathLike) -> None:
         p.paragraph_format.space_before = Pt(0)
 
         if is_ruby_para:
-            run.font.size = Pt(7.5)
+            # Use gray color to distinguish ruby without breaking alignment.
+            # Using the same size (10.5pt) ensures that spaces and characters
+            # align perfectly with the line below.
+            from docx.shared import RGBColor
+            run.font.color.rgb = RGBColor(0x80, 0x80, 0x80)
 
     # Ensure parent directory exists.
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
