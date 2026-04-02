@@ -39,16 +39,26 @@ _NULL_TERMINATOR_LENGTH = 10
 
 
 @dataclass
+class BungoSegment:
+    """A segment of text that can be normal or ruby/annotation."""
+    text: str
+    is_ruby: bool = False
+
+
+@dataclass
 class BungoDocument:
     """Parsed content of a 文豪mini document."""
 
-    paragraphs: list[str] = field(default_factory=list)
-    """Each element is one paragraph (split on line breaks)."""
+    paragraphs: list[list[BungoSegment]] = field(default_factory=list)
+    """Each element is a list of segments forming one paragraph."""
 
     @property
     def full_text(self) -> str:
-        """The entire document as a single string with newlines."""
-        return "\n".join(self.paragraphs)
+        """The entire document as a single string (including Ruby)."""
+        lines = []
+        for para in self.paragraphs:
+            lines.append("".join(s.text for s in para))
+        return "\n".join(lines)
 
 
 class BungoParser:
@@ -76,8 +86,8 @@ class BungoParser:
         """Load and parse the document, returning a :class:`BungoDocument`."""
         self._load()
         offset = self._detect_text_start()
-        raw_text = self._extract_text(offset)
-        paragraphs = self._split_paragraphs(raw_text)
+        segments = self._extract_segments(offset)
+        paragraphs = self._split_paragraphs(segments)
         return BungoDocument(paragraphs=paragraphs)
 
     # ------------------------------------------------------------------
@@ -158,18 +168,23 @@ class BungoParser:
                 i += 1
         return printable / len(data)
 
-    def _extract_text(self, offset: int) -> str:
-        """Extract raw text string from *self._data* starting at *offset*."""
+    def _extract_segments(self, offset: int) -> list[BungoSegment]:
+        """Extract text segments from *self._data* starting at *offset*."""
         data = self._data
         if not data:
-            return ""
+            return []
 
         # Determine if we are in 4-byte JIS mode
         sample = data[offset : offset + 128]
         if self._is_4byte_jis(sample):
-            return self._extract_text_4byte(offset)
+            return self._extract_segments_4byte(offset)
 
-        buf: list[str] = []
+        return self._extract_segments_legacy(offset)
+
+    def _extract_segments_legacy(self, offset: int) -> list[BungoSegment]:
+        """Legacy Shift-JIS segment extraction."""
+        data = self._data
+        res: list[BungoSegment] = []
         i = offset
         while i < len(data):
             b = data[i]
@@ -194,20 +209,20 @@ class BungoParser:
             # ── Line/page breaks ─────────────────────────────────────
             if b == 0x0D:
                 if i + 1 < len(data) and data[i + 1] == 0x0A:
-                    buf.append("\n")
+                    res.append(BungoSegment("\n"))
                     i += 2
                 else:
-                    buf.append("\n")
+                    res.append(BungoSegment("\n"))
                     i += 1
                 continue
 
             if b == 0x0A:
-                buf.append("\n")
+                res.append(BungoSegment("\n"))
                 i += 1
                 continue
 
             if b == 0x0C:          # Form feed → paragraph break
-                buf.append("\n\n")
+                res.append(BungoSegment("\n\n"))
                 i += 1
                 continue
 
@@ -218,14 +233,14 @@ class BungoParser:
 
             # ── ASCII printable ──────────────────────────────────────
             if 0x20 <= b <= 0x7E:
-                buf.append(chr(b))
+                res.append(BungoSegment(chr(b)))
                 i += 1
                 continue
 
             # ── Half-width kana (single byte Shift-JIS) ──────────────
             if 0xA1 <= b <= 0xDF:
                 try:
-                    buf.append(bytes([b]).decode("shift_jis"))
+                    res.append(BungoSegment(bytes([b]).decode("shift_jis")))
                 except (UnicodeDecodeError, ValueError):
                     pass
                 i += 1
@@ -236,7 +251,7 @@ class BungoParser:
                 b2 = data[i + 1]
                 if 0x40 <= b2 <= 0xFC and b2 != 0x7F:
                     try:
-                        buf.append(bytes([b, b2]).decode("shift_jis"))
+                        res.append(BungoSegment(bytes([b, b2]).decode("shift_jis")))
                     except (UnicodeDecodeError, ValueError):
                         pass
                     i += 2
@@ -245,12 +260,12 @@ class BungoParser:
             # ── Unrecognised byte — skip ─────────────────────────────
             i += 1
 
-        return "".join(buf)
+        return res
 
-    def _extract_text_4byte(self, offset: int) -> str:
+    def _extract_segments_4byte(self, offset: int) -> list[BungoSegment]:
         """Extract text from 4-byte JIS encoded data."""
         data = self._data
-        buf: list[str] = []
+        res: list[BungoSegment] = []
         i = offset
 
         while i + 3 < len(data):
@@ -259,7 +274,7 @@ class BungoParser:
 
             # Line break / Special control
             if b0 == 0x40 and b1 == 0x20:
-                buf.append("\n")
+                res.append(BungoSegment("\n"))
                 i += 4
                 continue
 
@@ -275,31 +290,57 @@ class BungoParser:
                     try:
                         # Convert JIS to EUC-JP for decoding
                         char = bytes([b2 + 0x80, b3 + 0x80]).decode("euc-jp")
-                        buf.append(char)
+                        res.append(BungoSegment(char))
                     except (UnicodeDecodeError, ValueError):
                         pass
             elif b1 == 0x0F:
-                # Half-width kana (JIS X 0201)
-                # Each unit can contain two characters in b2 and b3.
-                for sb in (b2, b3):
-                    if 0xA1 <= sb <= 0xDF:
-                        try:
-                            buf.append(bytes([sb]).decode("cp932"))
-                        except (UnicodeDecodeError, ValueError):
-                            pass
-                    elif 0x20 <= sb <= 0x7E:
-                        buf.append(chr(sb))
+                # Half-width kana (JIS X 0201) / Ruby
+                # 0xA1 (｡) is often used as a redundant filler prefix in 4-byte units.
+                if b2 == 0xA1 and b3 != 0xA1:
+                    # Single character in b3 (common case)
+                    try:
+                        char = bytes([b3]).decode("cp932")
+                        res.append(BungoSegment(char, is_ruby=True))
+                    except (UnicodeDecodeError, ValueError):
+                        pass
+                else:
+                    # Two characters in b2 and b3 (or something else)
+                    for sb in (b2, b3):
+                        if 0xA1 <= sb <= 0xDF:
+                            try:
+                                char = bytes([sb]).decode("cp932")
+                                res.append(BungoSegment(char, is_ruby=True))
+                            except (UnicodeDecodeError, ValueError):
+                                pass
+                        elif 0x20 <= sb <= 0x7E:
+                            res.append(BungoSegment(chr(sb), is_ruby=True))
 
             i += 4
 
-        return "".join(buf)
+        return res
 
     @staticmethod
-    def _split_paragraphs(text: str) -> list[str]:
-        """Split *text* into a list of non-empty paragraph strings."""
-        paragraphs = text.split("\n")
-        # Preserve paragraph structure but drop truly empty tail lines
-        # caused by trailing newlines.
-        while paragraphs and paragraphs[-1] == "":
+    def _split_paragraphs(segments: list[BungoSegment]) -> list[list[BungoSegment]]:
+        """Split a list of segments into paragraphs by line breaks."""
+        paragraphs: list[list[BungoSegment]] = []
+        current_para: list[BungoSegment] = []
+
+        for s in segments:
+            if s.text == "\n":
+                paragraphs.append(current_para)
+                current_para = []
+            elif s.text == "\n\n":
+                paragraphs.append(current_para)
+                paragraphs.append([])  # Blank line
+                current_para = []
+            else:
+                current_para.append(s)
+
+        if current_para:
+            paragraphs.append(current_para)
+
+        # Drop trailing empty paragraphs
+        while paragraphs and not paragraphs[-1]:
             paragraphs.pop()
-        return paragraphs if paragraphs else [""]
+
+        return paragraphs if paragraphs else [[]]
