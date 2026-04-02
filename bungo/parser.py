@@ -28,6 +28,7 @@ from typing import Optional
 
 # Known header sizes for 文豪mini series
 HEADER_SIZE_MINI5 = 0x200  # 512 bytes — 文豪mini5 series
+HEADER_SIZE_BUNGO_DOC = 0x2000  # 8192 bytes — Bungo DOC format
 HEADER_SIZE_DEFAULT = 0x200
 
 # Minimum fraction of "printable" bytes to consider a region as text
@@ -95,7 +96,14 @@ class BungoParser:
             # Caller specified the header size explicitly — trust it.
             return min(self._header_size, len(data))
 
-        # Try the canonical 文豪mini5 header size first.
+        # Try the DOC header size first.
+        if len(data) > HEADER_SIZE_BUNGO_DOC:
+            # Check for the characteristic 4-byte JIS pattern at 0x2000
+            chunk = data[HEADER_SIZE_BUNGO_DOC : HEADER_SIZE_BUNGO_DOC + 128]
+            if self._is_4byte_jis(chunk):
+                return HEADER_SIZE_BUNGO_DOC
+
+        # Try the canonical 文豪mini5 header size.
         candidate = HEADER_SIZE_MINI5
         if len(data) > candidate and self._text_fraction(data[candidate:candidate + 128]) >= _MIN_TEXT_FRACTION:
             return candidate
@@ -108,6 +116,18 @@ class BungoParser:
 
         # Last resort: start from the very beginning.
         return 0
+
+    @staticmethod
+    def _is_4byte_jis(data: bytes) -> bool:
+        """Check if *data* looks like 4-byte JIS encoded text."""
+        if len(data) < 4:
+            return False
+        # Count blocks that start with 00 00 or 00 0F
+        count = 0
+        for i in range(0, (len(data) // 4) * 4, 4):
+            if data[i] == 0x00 and (data[i + 1] == 0x00 or data[i + 1] == 0x0F):
+                count += 1
+        return count >= (len(data) // 16)
 
     @staticmethod
     def _text_fraction(data: bytes) -> float:
@@ -141,9 +161,16 @@ class BungoParser:
     def _extract_text(self, offset: int) -> str:
         """Extract raw text string from *self._data* starting at *offset*."""
         data = self._data
+        if not data:
+            return ""
+
+        # Determine if we are in 4-byte JIS mode
+        sample = data[offset : offset + 128]
+        if self._is_4byte_jis(sample):
+            return self._extract_text_4byte(offset)
+
         buf: list[str] = []
         i = offset
-
         while i < len(data):
             b = data[i]
 
@@ -217,6 +244,53 @@ class BungoParser:
 
             # ── Unrecognised byte — skip ─────────────────────────────
             i += 1
+
+        return "".join(buf)
+
+    def _extract_text_4byte(self, offset: int) -> str:
+        """Extract text from 4-byte JIS encoded data."""
+        data = self._data
+        buf: list[str] = []
+        i = offset
+
+        while i + 3 < len(data):
+            unit = data[i : i + 4]
+            b0, b1, b2, b3 = unit
+
+            # Line break / Special control
+            if b0 == 0x40 and b1 == 0x20:
+                buf.append("\n")
+                i += 4
+                continue
+
+            if b0 == 0x40 and b1 == 0x7F:
+                # End of document marker
+                break
+
+            if b1 == 0x00:
+                # Full-width JIS X 0208
+                if b2 == 0x00 and b3 == 0x00:
+                    pass  # Padding
+                elif 0x21 <= b2 <= 0x7E and 0x21 <= b3 <= 0x7E:
+                    try:
+                        # Convert JIS to EUC-JP for decoding
+                        char = bytes([b2 + 0x80, b3 + 0x80]).decode("euc-jp")
+                        buf.append(char)
+                    except (UnicodeDecodeError, ValueError):
+                        pass
+            elif b1 == 0x0F:
+                # Half-width kana (JIS X 0201)
+                # Each unit can contain two characters in b2 and b3.
+                for sb in (b2, b3):
+                    if 0xA1 <= sb <= 0xDF:
+                        try:
+                            buf.append(bytes([sb]).decode("cp932"))
+                        except (UnicodeDecodeError, ValueError):
+                            pass
+                    elif 0x20 <= sb <= 0x7E:
+                        buf.append(chr(sb))
+
+            i += 4
 
         return "".join(buf)
 

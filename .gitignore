@@ -22,3 +22,5 @@ env/
 .vscode/
 *.swp
 *.swo
+.DS_Store
+temp/
