@@ -76,8 +76,3 @@ python bungo_converter.py document.doc --header-size 512
 - **テキスト (.txt) 出力**: 可読性を高めるためにルビ（半角属性の文字）を自動的に除去します。
 - **Word (.docx) 出力**: 元のレイアウトを再現するため、全角・半角が揃う等幅フォント（MS ゴシック）を使用します。また、ルビのみの行は自動的にフォントサイズを小さく調整します。
 
-## テスト
-
-```bash
-python -m pytest tests/ -v
-```
