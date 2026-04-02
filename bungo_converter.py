@@ -35,9 +35,10 @@ def _build_parser() -> argparse.ArgumentParser:
 """,
     )
     ap.add_argument(
-        "input",
+        "inputs",
         metavar="INPUT",
-        help="変換する文豪miniの文書ファイル",
+        nargs="+",
+        help="変換する文豪miniの文書ファイル (ワイルドカード等で複数指定可能)",
     )
     ap.add_argument(
         "-f", "--format",
@@ -51,7 +52,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "-o", "--output",
         metavar="OUTPUT",
         default=None,
-        help="出力ファイルパス (省略時は入力ファイルと同じディレクトリに出力)",
+        help="出力ファイルパスまたはディレクトリ (複数ファイル時はディレクトリとして扱われます)",
     )
     ap.add_argument(
         "--header-size",
@@ -67,40 +68,52 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _default_output(input_path: str, fmt: str) -> str:
-    stem = Path(input_path).stem
-    parent = Path(input_path).parent
-    return str(parent / f"{stem}.{fmt}")
+    path = Path(input_path)
+    return str(path.with_suffix(f".{fmt}"))
 
 
 def main(argv: list[str] | None = None) -> int:
     ap = _build_parser()
     args = ap.parse_args(argv)
 
-    input_path: str = args.input
+    inputs: list[str] = args.inputs
     fmt: str = args.fmt
-    output_path: str = args.output or _default_output(input_path, fmt)
+    output_arg: str | None = args.output
     header_size: int | None = args.header_size
 
-    # ── Parse ────────────────────────────────────────────────────────────
-    try:
-        parser = BungoParser(input_path, header_size=header_size)
-        doc = parser.parse()
-    except FileNotFoundError as exc:
-        print(f"エラー: {exc}", file=sys.stderr)
-        return 1
-    except Exception as exc:  # noqa: BLE001
-        print(f"解析エラー: {exc}", file=sys.stderr)
-        return 1
+    success_count = 0
+    error_count = 0
 
-    # ── Convert ──────────────────────────────────────────────────────────
-    try:
-        convert(doc, output_path, fmt)
-    except Exception as exc:  # noqa: BLE001
-        print(f"変換エラー: {exc}", file=sys.stderr)
-        return 1
+    for input_path in inputs:
+        # Determine output path
+        if output_arg:
+            out_p = Path(output_arg)
+            if out_p.is_dir() or len(inputs) > 1:
+                # If it's a directory or we have multiple files, treat output_arg as base dir
+                actual_output = str(out_p / Path(input_path).with_suffix(f".{fmt}").name)
+                # Create directory if it doesn't exist
+                out_p.mkdir(parents=True, exist_ok=True)
+            else:
+                actual_output = output_arg
+        else:
+            actual_output = _default_output(input_path, fmt)
 
-    print(f"変換完了: {output_path}")
-    return 0
+        # ── Parse ────────────────────────────────────────────────────────────
+        try:
+            parser = BungoParser(input_path, header_size=header_size)
+            doc = parser.parse()
+            # ── Convert ──────────────────────────────────────────────────────
+            convert(doc, actual_output, fmt)
+            print(f"変換完了: {input_path} -> {actual_output}")
+            success_count += 1
+        except Exception as exc:  # noqa: BLE001
+            print(f"エラー ({input_path}): {exc}", file=sys.stderr)
+            error_count += 1
+
+    if len(inputs) > 1:
+        print(f"\n全{len(inputs)}件中 {success_count}件成功, {error_count}件失敗")
+
+    return 0 if error_count == 0 else 1
 
 
 if __name__ == "__main__":
